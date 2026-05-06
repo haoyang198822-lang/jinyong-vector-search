@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+向量数据库学习打卡 - Streamlit 交互式向量检索 Web 应用
+使用阿里云 text-embedding-v4 + Faiss 实现《倚天屠龙记》章节检索
+
+启动方式: 
+  1. 命令行: cd 向量数据库学习打卡 && streamlit run app.py
+  2. 或直接: streamlit run 向量数据库学习打卡/app.py
+
+依赖: pip install streamlit openai faiss-cpu numpy
+"""
+
+import os
+import sys
+import json
+import hashlib
+import re
+import time
+import streamlit as st
+import numpy as np
+import faiss
+from openai import OpenAI
+
+# ============== 配置 ==============
+DATA_SOURCE = "金庸-倚天屠龙记txt精校版 .txt"
+
+# 向量配置
+EMBEDDING_MODEL = "text-embedding-v4"
+EMBEDDING_DIM = 1024
+BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# 分块配置
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 100
+BATCH_SIZE = 10
+API_INTERVAL = 0.1
+
+# 输出文件
+INDEX_FILE = "faiss_index_v4.bin"
+METADATA_FILE = "metadata_v4.json"
+EMBEDDINGS_FILE = "embeddings_v4.npy"
+
+
+# ============== 核心函数 ==============
+
+def load_text():
+    """加载文本文件（GBK编码）"""
+    with open(DATA_SOURCE, 'r', encoding='gbk', errors='ignore') as f:
+        text = f.read()
+    return text
+
+
+def detect_chapters(text):
+    """检测章节"""
+    chapter_patterns = [
+        r'\n第([一二三四五六七八九十百千零〇\d]+)章\s+(.+?)\n',
+        r'\n第([一二三四五六七八九十百千零〇\d]+)节\s+(.+?)\n',
+        r'\n第([一二三四五六七八九十百千零〇\d]+)回\s+(.+?)\n',
+        r'\n([一二三四五六七八九十\d]+)\s+(.+?)\n',
+    ]
+    
+    chapters = []
+    chapter_num_map = {
+        '一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+        '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+        '百': 100, '千': 1000, '零': 0, '〇': 0
+    }
+    
+    for pattern in chapter_patterns:
+        matches = re.finditer(pattern, text)
+        for match in matches:
+            start_pos = match.start()
+            num_str = match.group(1)
+            title = match.group(2).strip()
+            
+            if num_str.isdigit():
+                num = int(num_str)
+            else:
+                num = 0
+                temp = 0
+                for char in num_str:
+                    if char in '零〇':
+                        continue
+                    elif char in chapter_num_map and char not in '十百千':
+                        temp = chapter_num_map.get(char, 0)
+                    elif char == '十':
+                        temp = temp * 10 + 10 if temp > 0 else 10
+                    elif char == '百':
+                        temp = temp * 100 if temp > 0 else 100
+                    elif char == '千':
+                        temp = chapter_num_map.get(char, 0)
+                    elif char.isdigit():
+                        temp = int(char)
+                    num += temp
+                    temp = 0
+            
+            if num > 0:
+                chapters.append((start_pos, num, title))
+    
+    chapters.sort(key=lambda x: x[0])
+    seen = set()
+    filtered = []
+    for ch in chapters:
+        if ch[1] not in seen:
+            seen.add(ch[1])
+            filtered.append(ch)
+    
+    return filtered
+
+
+def get_chapter_info(pos, chapters):
+    """根据位置获取所在章节信息"""
+    chapter_num = 1
+    chapter_title = "序章"
+    for i, (start, num, title) in enumerate(chapters):
+        if pos >= start:
+            chapter_num = num
+            chapter_title = title
+        else:
+            break
+    return chapter_num, chapter_title
+
+
+def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """文本分块，句号边界优化"""
+    chunks = []
+    lines = text.split('\n')
+    
+    current_pos = 0
+    current_line = 0
+    current_chunk = ""
+    chunk_start_pos = 0
+    chunk_start_line = 0
+    
+    while current_line < len(lines):
+        line = lines[current_line]
+        line_len = len(line)
+        
+        if len(current_chunk) + line_len > chunk_size:
+            last_period = current_chunk.rfind('。')
+            if last_period > chunk_size * 0.6:
+                chunk_text_content = current_chunk[:last_period + 1]
+                chunks.append({
+                    'text': chunk_text_content,
+                    'start_pos': chunk_start_pos,
+                    'end_pos': chunk_start_pos + len(chunk_text_content),
+                    'start_line': chunk_start_line,
+                    'end_line': current_line - 1
+                })
+                overlap_text = current_chunk[max(0, last_period - overlap):]
+                chunk_start_pos = chunk_start_pos + last_period - overlap + 1
+                chunk_start_line = current_line - 1
+                current_chunk = overlap_text + '\n' + line
+            else:
+                chunks.append({
+                    'text': current_chunk.strip(),
+                    'start_pos': chunk_start_pos,
+                    'end_pos': chunk_start_pos + len(current_chunk),
+                    'start_line': chunk_start_line,
+                    'end_line': current_line - 1
+                })
+                chunk_start_pos = current_pos
+                chunk_start_line = current_line
+                current_chunk = line
+        else:
+            current_chunk += '\n' + line
+        
+        current_pos += line_len + 1
+        current_line += 1
+    
+    if current_chunk.strip():
+        chunks.append({
+            'text': current_chunk.strip(),
+            'start_pos': chunk_start_pos,
+            'end_pos': current_pos,
+            'start_line': chunk_start_line,
+            'end_line': current_line - 1
+        })
+    
+    return chunks
+
+
+def compute_text_hash(text):
+    """计算文本哈希"""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()[:16]
+
+
+def get_embedding_client(api_key):
+    """创建OpenAI兼容客户端"""
+    return OpenAI(api_key=api_key, base_url=BASE_URL)
+
+
+def get_embeddings_batch(client, texts, model=EMBEDDING_MODEL, progress_callback=None):
+    """批量获取文本向量"""
+    embeddings = []
+    total = len(texts)
+    
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
+        response = client.embeddings.create(
+            model=model,
+            input=batch
+        )
+        for item in response.data:
+            embeddings.append(item.embedding)
+        
+        if progress_callback:
+            progress_callback(min(i + BATCH_SIZE, total), total)
+        
+        if i + BATCH_SIZE < len(texts):
+            time.sleep(API_INTERVAL)
+    
+    return np.array(embeddings, dtype=np.float32)
+
+
+def build_faiss_index(embeddings):
+    """构建Faiss索引"""
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    normalized = embeddings / norms
+    
+    dim = normalized.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(normalized)
+    
+    return index, normalized
+
+
+def search(index, query_embedding, k=5):
+    """向量检索"""
+    norm = np.linalg.norm(query_embedding)
+    if norm > 0:
+        query_embedding = query_embedding / norm
+    
+    query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
+    similarities, indices = index.search(query_embedding, k)
+    
+    return similarities[0], indices[0]
+
+
+def save_index(index, embeddings, metadata):
+    """保存索引和元数据"""
+    faiss.write_index(index, INDEX_FILE)
+    np.save(EMBEDDINGS_FILE, embeddings)
+    
+    with open(METADATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def load_existing_index():
+    """加载已有索引"""
+    if os.path.exists(INDEX_FILE) and os.path.exists(METADATA_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        with open(METADATA_FILE, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        embeddings = np.load(EMBEDDINGS_FILE)
+        return index, metadata, embeddings
+    return None, None, None
+
+
+def build_vector_index(progress_callback=None):
+    """构建向量索引"""
+    text = load_text()
+    chapters = detect_chapters(text)
+    chunks = chunk_text(text)
+    
+    for i, chunk in enumerate(chunks):
+        chapter_num, chapter_title = get_chapter_info(chunk['start_pos'], chapters)
+        chunk['chunk_id'] = i
+        chunk['chapter_num'] = chapter_num
+        chunk['chapter_title'] = chapter_title
+        chunk['char_count'] = len(chunk['text'])
+        chunk['text_hash'] = compute_text_hash(chunk['text'])
+    
+    metadata = chunks
+    texts = [c['text'] for c in chunks]
+    
+    # 获取向量
+    client = get_embedding_client(st.session_state.api_key)
+    
+    def progressWrapper(current, total):
+        if progress_callback:
+            progress_callback(int(current * 0.8), total)  # 向量化占80%
+    
+    embeddings = get_embeddings_batch(client, texts, progress_callback=progressWrapper)
+    index, embeddings = build_faiss_index(embeddings)
+    
+    def finalProgress(current, total):
+        if progress_callback:
+            progress_callback(int(total * 0.8 + current * 0.2), total)
+    
+    if progress_callback:
+        finalProgress(100, 100)
+    
+    save_index(index, embeddings, metadata)
+    
+    return index, metadata, embeddings
+
+
+# ============== Streamlit 应用 ==============
+
+def init_session_state():
+    """初始化会话状态"""
+    defaults = {
+        'index': None,
+        'metadata': None,
+        'embeddings': None,
+        'query_history': [],
+        'search_results': None,
+        'last_query': None
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def sidebar_config():
+    """侧边栏配置"""
+    st.sidebar.title("⚙️ 配置")
+    
+    env_api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    
+    if env_api_key:
+        st.session_state.api_key = env_api_key
+        st.sidebar.success("✅ API Key 已从环境变量加载")
+    else:
+        st.session_state.api_key = st.sidebar.text_input(
+            "DASHSCOPE_API_KEY",
+            value="",
+            type="password",
+            help="阿里云 DashScope API Key\n建议通过环境变量设置"
+        )
+        st.sidebar.info("💡 export DASHSCOPE_API_KEY=your_key")
+    
+    if not st.session_state.api_key:
+        st.sidebar.warning("⚠️ 请设置 API Key")
+        return False
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📊 向量库主要信息")
+    
+    if st.session_state.index is None:
+        index, metadata, _ = load_existing_index()
+        if index is not None:
+            st.session_state.index = index
+            st.session_state.metadata = metadata
+            st.session_state.embeddings = _
+    
+    if st.session_state.metadata:
+        chapters = set(m['chapter_num'] for m in st.session_state.metadata)
+        chapter_list = sorted(chapters)
+        st.sidebar.metric("Chunk 数", len(st.session_state.metadata))
+        st.sidebar.metric("章节数", len(chapters))
+        st.sidebar.text(f"章节索引: {chapter_list[0]}-{chapter_list[-1]}" if chapter_list else "无")
+    elif st.session_state.index is not None:
+        st.sidebar.metric("记录数", st.session_state.index.ntotal)
+        st.sidebar.metric("维度", st.session_state.index.d)
+    else:
+        st.sidebar.info("📭 暂无索引")
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔨 一键构建向量库")
+    
+    if st.session_state.index is None:
+        if st.sidebar.button("🚀 构建向量库", type="primary", use_container_width=True):
+            progress_bar = st.sidebar.progress(0)
+            status_text = st.sidebar.empty()
+            
+            try:
+                def progress_callback(current, total):
+                    progress = int(current / total * 100)
+                    progress_bar.progress(progress)
+                    status_text.text(f"进度: {progress}%")
+                
+                with st.spinner("正在构建向量库..."):
+                    index, metadata, embeddings = build_vector_index(progress_callback)
+                    st.session_state.index = index
+                    st.session_state.metadata = metadata
+                    st.session_state.embeddings = embeddings
+                
+                progress_bar.empty()
+                status_text.empty()
+                st.sidebar.success(f"✅ 构建完成！共 {len(metadata)} 条")
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"❌ 构建失败: {str(e)}")
+    else:
+        st.sidebar.success("✅ 向量库已就绪")
+    
+    st.sidebar.markdown("---")
+    st.session_state.top_k = st.sidebar.slider(
+        "Top-K 数量",
+        min_value=1,
+        max_value=20,
+        value=5,
+        help="返回最相似的K条结果"
+    )
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🔍 示例查询")
+    
+    preset_queries = [
+        "张无忌和赵敏的故事",
+        "明教的高手有哪些",
+        "武当派的张三丰",
+        "倚天剑和屠龙刀的来历",
+        "六大派围攻光明顶"
+    ]
+    
+    for query in preset_queries:
+        if st.sidebar.button(query, key=f"preset_{query}", use_container_width=True):
+            st.session_state.last_query = query
+            st.rerun()
+    
+    return True
+
+
+def main_content():
+    """主内容区域"""
+    st.title("📚 倚天屠龙记 - 向量检索系统")
+    st.markdown("基于 **text-embedding-v4** + **Faiss** 的智能文本检索")
+    
+    st.markdown("---")
+    
+    query = st.text_input(
+        "🔎 输入查询内容",
+        value=st.session_state.get('last_query', ''),
+        placeholder="例如：张无忌修炼九阳神功",
+        help="输入问题进行语义检索"
+    )
+    
+    if query and query != st.session_state.get('last_query'):
+        st.session_state.last_query = query
+    
+    search_clicked = st.button("🚀 检索", type="primary") if query else False
+    
+    if (search_clicked or st.session_state.search_results) and query:
+        if st.session_state.index is None:
+            st.error("请先构建向量库")
+        else:
+            with st.spinner("正在检索..."):
+                try:
+                    client = get_embedding_client(st.session_state.api_key)
+                    query_embedding = get_embeddings_batch(client, [query])[0]
+                    similarities, indices = search(st.session_state.index, query_embedding, 
+                                                  k=st.session_state.top_k)
+                    
+                    results = []
+                    for sim, idx in zip(similarities, indices):
+                        if idx < len(st.session_state.metadata):
+                            chunk = st.session_state.metadata[idx]
+                            results.append({
+                                'similarity': float(sim),
+                                'chapter_num': chunk['chapter_num'],
+                                'chapter_title': chunk['chapter_title'],
+                                'start_line': chunk['start_line'],
+                                'end_line': chunk['end_line'],
+                                'text': chunk['text'],
+                                'char_count': chunk['char_count']
+                            })
+                    
+                    st.session_state.search_results = results
+                    
+                    if query not in st.session_state.query_history:
+                        st.session_state.query_history.append(query)
+                    
+                    st.session_state.last_query = None
+                    
+                except Exception as e:
+                    st.error(f"❌ 检索失败: {str(e)}")
+    
+    if st.session_state.search_results:
+        st.markdown("---")
+        st.subheader(f"📋 检索结果 (Top {len(st.session_state.search_results)})")
+        
+        for i, result in enumerate(st.session_state.search_results):
+            with st.container():
+                col1, col2 = st.columns([4, 1])
+                
+                with col1:
+                    similarity_percent = result['similarity'] * 100
+                    st.markdown(f"**#{i+1}** | 相似度: `{similarity_percent:.2f}%`")
+                    st.markdown(f"📖 {result['chapter_title']} | 行: {result['start_line']}-{result['end_line']}")
+                
+                with col2:
+                    st.metric("相似度", f"{similarity_percent:.1f}%")
+                
+                with st.expander("📄 查看原文", expanded=i < 2):
+                    st.text_area(
+                        "原文内容",
+                        result['text'],
+                        height=150,
+                        key=f"text_{i}",
+                        disabled=True
+                    )
+                
+                st.markdown("---")
+    
+    st.markdown("---")
+    st.subheader("📜 查询历史")
+    
+    if st.session_state.query_history:
+        cols = st.columns(2)
+        for i, hist in enumerate(reversed(st.session_state.query_history[-6:])):
+            with cols[i % 2]:
+                if st.button(f"↻ {hist[:25]}{'...' if len(hist) > 25 else ''}", 
+                           key=f"history_{i}", use_container_width=True):
+                    st.session_state.last_query = hist
+                    st.rerun()
+    else:
+        st.info("暂无查询历史")
+
+
+def main():
+    """主函数"""
+    st.set_page_config(
+        page_title="倚天屠龙记 - 向量检索",
+        page_icon="📚",
+        layout="wide"
+    )
+    
+    init_session_state()
+    
+    if sidebar_config():
+        main_content()
+    else:
+        st.warning("请在侧边栏配置 API Key")
+
+
+if __name__ == "__main__":
+    main()

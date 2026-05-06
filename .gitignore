@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data files (large binary files - should be regenerated)
+embeddings_v4.npy
+faiss_index_v4.bin
+metadata_v4.json
+stats_v4.json
+query_results_v4.txt
+
+# Environment
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Streamlit
+.streamlit/
