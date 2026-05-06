@@ -21,6 +21,8 @@ import streamlit as st
 import numpy as np
 import faiss
 from openai import OpenAI
+import networkx as nx
+from pyvis.network import Network
 
 # ============== 配置 ==============
 DATA_SOURCE = "金庸-倚天屠龙记txt精校版 .txt"
@@ -283,6 +285,230 @@ def rag_answer(client, question, retrieved_chunks, model=LLM_MODEL):
         return f"生成回答失败: {str(e)}"
 
 
+# ============== 知识图谱数据 ==============
+CHARACTERS = [
+    # 主要人物
+    "张无忌", "赵敏", "周芷若", "殷素素", "张翠山", "张三丰", "谢逊",
+    # 明教
+    "杨逍", "范遥", "韦一笑", "殷天正", "黛绮丝", "小昭",
+    # 武当
+    "宋远桥", "俞莲舟", "俞岱岩", "张松溪", "殷梨亭", "莫声谷",
+    # 峨眉
+    "灭绝师太", "丁敏君",
+    # 少林
+    "空闻", "空智", "空性",
+    # 其他
+    "成昆", "陈友谅", "汝阳王", "王保保"
+]
+
+FACTIONS = [
+    "明教", "武当派", "峨眉派", "少林派", "丐帮", "天鹰教", "汝阳王府"
+]
+
+MARTIAL_ARTS = [
+    "九阳神功", "乾坤大挪移", "太极拳", "太极剑", "玄冥神掌",
+    "九阴白骨爪", "降龙十八掌", "少林龙爪手", "七伤拳",
+    "峨嵋九阳功", "兰花拂穴手", "无声无色", "壁虎游墙功"
+]
+
+RELATIONSHIPS = [
+    # 人物-人物关系
+    ("张无忌", "爱慕", "赵敏"),
+    ("张无忌", "爱慕", "周芷若"),
+    ("张无忌", "义父", "谢逊"),
+    ("张无忌", "父亲", "张翠山"),
+    ("张无忌", "母亲", "殷素素"),
+    ("张无忌", "师祖", "张三丰"),
+    ("张翠山", "妻子", "殷素素"),
+    ("张翠山", "师父", "张三丰"),
+    ("殷素素", "丈夫", "张翠山"),
+    ("赵敏", "爱慕", "张无忌"),
+    ("周芷若", "爱慕", "张无忌"),
+    ("谢逊", "义子", "张无忌"),
+    ("张三丰", "徒弟", "宋远桥"),
+    ("张三丰", "徒弟", "俞莲舟"),
+    ("张三丰", "徒弟", "张翠山"),
+    ("张三丰", "徒孙", "张无忌"),
+    ("杨逍", "下属", "张无忌"),
+    ("范遥", "下属", "张无忌"),
+    ("韦一笑", "下属", "张无忌"),
+    ("殷天正", "下属", "张无忌"),
+    ("灭绝师太", "徒弟", "周芷若"),
+    ("灭绝师太", "徒弟", "丁敏君"),
+    ("成昆", "仇人", "谢逊"),
+    ("汝阳王", "女儿", "赵敏"),
+    ("汝阳王", "儿子", "王保保"),
+    
+    # 人物-门派关系
+    ("张无忌", "属于", "明教"),
+    ("张无忌", "属于", "武当派"),
+    ("赵敏", "属于", "汝阳王府"),
+    ("周芷若", "属于", "峨眉派"),
+    ("张三丰", "属于", "武当派"),
+    ("谢逊", "属于", "明教"),
+    ("杨逍", "属于", "明教"),
+    ("范遥", "属于", "明教"),
+    ("韦一笑", "属于", "明教"),
+    ("殷天正", "属于", "明教"),
+    ("殷素素", "属于", "天鹰教"),
+    ("张翠山", "属于", "武当派"),
+    ("宋远桥", "属于", "武当派"),
+    ("俞莲舟", "属于", "武当派"),
+    ("灭绝师太", "属于", "峨眉派"),
+    ("丁敏君", "属于", "峨眉派"),
+    ("空闻", "属于", "少林派"),
+    ("空智", "属于", "少林派"),
+    ("空性", "属于", "少林派"),
+    ("成昆", "属于", "少林派"),
+    ("陈友谅", "属于", "丐帮"),
+    
+    # 人物-武功关系
+    ("张无忌", "修炼", "九阳神功"),
+    ("张无忌", "修炼", "乾坤大挪移"),
+    ("张无忌", "修炼", "太极拳"),
+    ("张无忌", "修炼", "太极剑"),
+    ("张三丰", "创编", "太极拳"),
+    ("张三丰", "创编", "太极剑"),
+    ("张三丰", "修炼", "九阳神功"),
+    ("张翠山", "修炼", "太极拳"),
+    ("谢逊", "修炼", "七伤拳"),
+    ("成昆", "修炼", "幻阴指"),
+    ("成昆", "修炼", "少林九阳功"),
+    ("杨逍", "修炼", "乾坤大挪移"),
+    ("殷天正", "修炼", "鹰爪功"),
+    ("灭绝师太", "修炼", "峨嵋九阳功"),
+    ("周芷若", "修炼", "九阴白骨爪"),
+    ("赵敏", "修炼", "玄冥神掌"),
+    ("韦一笑", "修炼", "寒冰绵掌"),
+    ("宋远桥", "修炼", "太极拳"),
+    ("俞莲舟", "修炼", "太极拳"),
+    
+    # 门派-门派关系
+    ("明教", "敌对", "武当派"),
+    ("明教", "敌对", "峨眉派"),
+    ("明教", "敌对", "少林派"),
+    ("明教", "敌对", "丐帮"),
+    ("武当派", "友好", "少林派"),
+    ("峨眉派", "友好", "少林派"),
+    ("汝阳王府", "敌对", "明教"),
+]
+
+def build_knowledge_graph():
+    """构建知识图谱"""
+    G = nx.Graph()
+    
+    # 添加人物节点
+    for char in CHARACTERS:
+        G.add_node(char, type='character', color='#E8E8E8', size=20)
+    
+    # 添加门派节点
+    for faction in FACTIONS:
+        G.add_node(faction, type='faction', color='#D4E5E5', size=30)
+    
+    # 添加武功节点
+    for art in MARTIAL_ARTS:
+        G.add_node(art, type='martial_art', color='#F5E6D3', size=15)
+    
+    # 添加关系边
+    for source, relation, target in RELATIONSHIPS:
+        if source in G.nodes and target in G.nodes:
+            G.add_edge(source, target, label=relation)
+    
+    return G
+
+def generate_graph_html(graph):
+    """生成图谱HTML"""
+    net = Network(height="600px", width="100%", directed=True, bgcolor="#1a1a1a")
+    
+    for node in graph.nodes(data=True):
+        node_name, attrs = node
+        node_type = attrs.get('type', 'character')
+        
+        if node_type == 'character':
+            color = '#ffffff'
+            font_color = '#1a1a1a'
+            size = 20
+        elif node_type == 'faction':
+            color = '#a0d2db'
+            font_color = '#1a1a1a'
+            size = 30
+        else:  # martial_art
+            color = '#f0d9b5'
+            font_color = '#1a1a1a'
+            size = 15
+        
+        net.add_node(
+            node_name,
+            label=node_name,
+            color=color,
+            size=size,
+            font={'size': 14, 'color': font_color},
+            shape='circle',
+            borderWidth=0,
+            shadow=False
+        )
+    
+    for edge in graph.edges(data=True):
+        source, target, attrs = edge
+        label = attrs.get('label', '')
+        net.add_edge(source, target, label=label, font={'size': 10, 'color': '#ffffff', 'strokeWidth': 0}, color='#666666')
+    
+    # 设置布局
+    net.set_options("""
+    {
+      "physics": {
+        "enabled": true,
+        "stabilization": {
+          "enabled": true,
+          "iterations": 100,
+          "updateInterval": 25
+        },
+        "barnesHut": {
+          "gravitationalConstant": -3000,
+          "centralGravity": 0.3,
+          "springLength": 250,
+          "springConstant": 0.04,
+          "damping": 0.09,
+          "avoidOverlap": 0.5
+        }
+      },
+      "interaction": {
+        "hover": true,
+        "tooltipDelay": 100,
+        "hideEdgesOnDrag": false,
+        "hideEdgesOnZoom": false
+      },
+      "nodes": {
+        "borderWidth": 0,
+        "shadow": false,
+        "color": {
+          "background": "#ffffff",
+          "border": "#1a1a1a",
+          "highlight": {
+            "background": "#4a90d9",
+            "border": "#4a90d9"
+          }
+        }
+      },
+      "edges": {
+        "smooth": {
+          "enabled": true
+        },
+        "color": {
+          "color": "#666666",
+          "highlight": "#888888",
+          "hover": "#888888"
+        }
+      }
+    }
+    """)
+    
+    # 保存到临时文件
+    html_path = "/tmp/kg_graph.html"
+    net.write_html(html_path)
+    return html_path
+
+
 def save_index(index, embeddings, metadata):
     """保存索引和元数据"""
     faiss.write_index(index, INDEX_FILE)
@@ -471,13 +697,16 @@ def main_content():
     
     st.markdown("---")
     
-    tab1, tab2 = st.tabs(["语义检索", "RAG智能问答"])
+    tab1, tab2, tab3 = st.tabs(["语义检索", "RAG智能问答", "知识图谱"])
     
     with tab1:
         search_tab()
     
     with tab2:
         rag_tab()
+    
+    with tab3:
+        kg_tab()
     
     st.markdown("---")
     st.subheader("查询历史")
@@ -652,6 +881,60 @@ def rag_tab():
             st.session_state.rag_answer = None
             st.session_state.retrieved_chunks = None
             st.rerun()
+
+
+def kg_tab():
+    """知识图谱标签页"""
+    st.markdown("### 知识图谱")
+    st.caption("展示《倚天屠龙记》中的人物、门派和武功关系")
+    
+    # 筛选选项
+    filter_options = ["全部", "仅人物", "仅门派", "仅武功", "人物与门派", "人物与武功"]
+    selected_filter = st.selectbox("筛选显示", filter_options)
+    
+    with st.spinner("正在生成图谱..."):
+        # 构建图谱
+        G = build_knowledge_graph()
+        
+        # 应用筛选
+        if selected_filter == "仅人物":
+            nodes_to_keep = [n for n in G.nodes if G.nodes[n].get('type') == 'character']
+            G = G.subgraph(nodes_to_keep)
+        elif selected_filter == "仅门派":
+            nodes_to_keep = [n for n in G.nodes if G.nodes[n].get('type') == 'faction']
+            G = G.subgraph(nodes_to_keep)
+        elif selected_filter == "仅武功":
+            nodes_to_keep = [n for n in G.nodes if G.nodes[n].get('type') == 'martial_art']
+            G = G.subgraph(nodes_to_keep)
+        elif selected_filter == "人物与门派":
+            nodes_to_keep = [n for n in G.nodes if G.nodes[n].get('type') in ['character', 'faction']]
+            G = G.subgraph(nodes_to_keep)
+        elif selected_filter == "人物与武功":
+            nodes_to_keep = [n for n in G.nodes if G.nodes[n].get('type') in ['character', 'martial_art']]
+            G = G.subgraph(nodes_to_keep)
+        
+        # 生成HTML
+        html_path = generate_graph_html(G)
+        
+        # 显示图谱
+        st.markdown("---")
+        st.components.v1.html(open(html_path, 'r', encoding='utf-8').read(), height=650)
+    
+    # 图例
+    st.markdown("---")
+    st.markdown("#### 图例")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("**人物**")
+        st.markdown('<div style="background-color: #ffffff; width: 20px; height: 20px; border-radius: 50%; display: inline-block;"></div> 白色圆形节点', unsafe_allow_html=True)
+    with col2:
+        st.markdown("**门派**")
+        st.markdown('<div style="background-color: #a0d2db; width: 25px; height: 25px; border-radius: 50%; display: inline-block;"></div> 浅蓝色圆形节点', unsafe_allow_html=True)
+    with col3:
+        st.markdown("**武功**")
+        st.markdown('<div style="background-color: #f0d9b5; width: 18px; height: 18px; border-radius: 50%; display: inline-block;"></div> 浅棕圆形节点', unsafe_allow_html=True)
+    
+    st.caption("提示：拖拽节点可调整位置，滚轮可缩放，悬停查看关系")
 
 
 def main():
