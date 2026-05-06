@@ -30,6 +30,9 @@ EMBEDDING_MODEL = "text-embedding-v4"
 EMBEDDING_DIM = 1024
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
+# LLM 配置 (RAG用)
+LLM_MODEL = "qwen-plus"
+
 # 分块配置
 CHUNK_SIZE = 400
 CHUNK_OVERLAP = 100
@@ -232,11 +235,52 @@ def search(index, query_embedding, k=5):
     norm = np.linalg.norm(query_embedding)
     if norm > 0:
         query_embedding = query_embedding / norm
-    
+
     query_embedding = query_embedding.reshape(1, -1).astype(np.float32)
     similarities, indices = index.search(query_embedding, k)
-    
+
     return similarities[0], indices[0]
+
+
+def rag_answer(client, question, retrieved_chunks, model=LLM_MODEL):
+    """基于检索结果生成回答 (RAG)"""
+    context = "\n\n".join([
+        f"【片段{i+1}】（第{chunk['chapter_num']}章 {chunk['chapter_title']} 第{chunk['start_line']}-{chunk['end_line']}行）:\n{chunk['text']}"
+        for i, chunk in enumerate(retrieved_chunks)
+    ])
+
+    system_prompt = """你是一个精通《倚天屠龙记》的文学助手。你的任务是基于给定的原文片段回答用户的问题。
+
+要求：
+1. 只基于提供的原文片段回答，不要编造内容
+2. 如果片段不足以回答，请明确说明"根据提供的信息无法回答"
+3. 回答要条理清晰，适当引用原文
+4. 用中文回答，语言流畅自然
+5. 如果涉及多个片段，可以综合整理后回答"""
+
+    user_prompt = f"""请基于以下原文片段回答问题：
+
+{context}
+
+---
+
+问题：{question}
+
+回答："""
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"生成回答失败: {str(e)}"
 
 
 def save_index(index, embeddings, metadata):
@@ -308,7 +352,10 @@ def init_session_state():
         'embeddings': None,
         'query_history': [],
         'search_results': None,
-        'last_query': None
+        'last_query': None,
+        'rag_question': None,
+        'retrieved_chunks': None,
+        'rag_answer': None
     }
     
     for key, value in defaults.items():
@@ -318,13 +365,13 @@ def init_session_state():
 
 def sidebar_config():
     """侧边栏配置"""
-    st.sidebar.title("⚙️ 配置")
+    st.sidebar.title("配置")
     
     env_api_key = os.getenv("DASHSCOPE_API_KEY", "")
     
     if env_api_key:
         st.session_state.api_key = env_api_key
-        st.sidebar.success("✅ API Key 已从环境变量加载")
+        st.sidebar.success("API Key 已从环境变量加载")
     else:
         st.session_state.api_key = st.sidebar.text_input(
             "DASHSCOPE_API_KEY",
@@ -332,14 +379,14 @@ def sidebar_config():
             type="password",
             help="阿里云 DashScope API Key\n建议通过环境变量设置"
         )
-        st.sidebar.info("💡 export DASHSCOPE_API_KEY=your_key")
+        st.sidebar.info("export DASHSCOPE_API_KEY=your_key")
     
     if not st.session_state.api_key:
-        st.sidebar.warning("⚠️ 请设置 API Key")
+        st.sidebar.warning("请设置 API Key")
         return False
     
     st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 向量库主要信息")
+    st.sidebar.subheader("向量库主要信息")
     
     if st.session_state.index is None:
         index, metadata, _ = load_existing_index()
@@ -358,13 +405,13 @@ def sidebar_config():
         st.sidebar.metric("记录数", st.session_state.index.ntotal)
         st.sidebar.metric("维度", st.session_state.index.d)
     else:
-        st.sidebar.info("📭 暂无索引")
+        st.sidebar.info("暂无索引")
     
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🔨 一键构建向量库")
+    st.sidebar.subheader("一键构建向量库")
     
     if st.session_state.index is None:
-        if st.sidebar.button("🚀 构建向量库", type="primary", use_container_width=True):
+        if st.sidebar.button("构建向量库", type="primary", use_container_width=True):
             progress_bar = st.sidebar.progress(0)
             status_text = st.sidebar.empty()
             
@@ -382,12 +429,12 @@ def sidebar_config():
                 
                 progress_bar.empty()
                 status_text.empty()
-                st.sidebar.success(f"✅ 构建完成！共 {len(metadata)} 条")
+                st.sidebar.success(f"构建完成！共 {len(metadata)} 条")
                 st.rerun()
             except Exception as e:
-                st.sidebar.error(f"❌ 构建失败: {str(e)}")
+                st.sidebar.error(f"构建失败: {str(e)}")
     else:
-        st.sidebar.success("✅ 向量库已就绪")
+        st.sidebar.success("向量库已就绪")
     
     st.sidebar.markdown("---")
     st.session_state.top_k = st.sidebar.slider(
@@ -399,7 +446,7 @@ def sidebar_config():
     )
     
     st.sidebar.markdown("---")
-    st.sidebar.subheader("🔍 示例查询")
+    st.sidebar.subheader("示例查询")
     
     preset_queries = [
         "张无忌和赵敏的故事",
@@ -419,13 +466,41 @@ def sidebar_config():
 
 def main_content():
     """主内容区域"""
-    st.title("📚 倚天屠龙记 - 向量检索系统")
+    st.title("倚天屠龙记 - 向量检索系统")
     st.markdown("基于 **text-embedding-v4** + **Faiss** 的智能文本检索")
     
     st.markdown("---")
     
+    tab1, tab2 = st.tabs(["语义检索", "RAG智能问答"])
+    
+    with tab1:
+        search_tab()
+    
+    with tab2:
+        rag_tab()
+    
+    st.markdown("---")
+    st.subheader("查询历史")
+    
+    if st.session_state.query_history:
+        cols = st.columns(2)
+        for i, hist in enumerate(reversed(st.session_state.query_history[-6:])):
+            with cols[i % 2]:
+                if st.button(f"{hist[:25]}{'...' if len(hist) > 25 else ''}", 
+                           key=f"history_{i}", use_container_width=True):
+                    st.session_state.last_query = hist
+                    st.rerun()
+    else:
+        st.info("暂无查询历史")
+
+
+def search_tab():
+    """语义检索标签页"""
+    st.markdown("### 语义检索模式")
+    st.caption("基于向量相似度，直接返回最相关的文本片段")
+    
     query = st.text_input(
-        "🔎 输入查询内容",
+        "输入查询内容",
         value=st.session_state.get('last_query', ''),
         placeholder="例如：张无忌修炼九阳神功",
         help="输入问题进行语义检索"
@@ -434,7 +509,7 @@ def main_content():
     if query and query != st.session_state.get('last_query'):
         st.session_state.last_query = query
     
-    search_clicked = st.button("🚀 检索", type="primary") if query else False
+    search_clicked = st.button("检索", type="primary") if query else False
     
     if (search_clicked or st.session_state.search_results) and query:
         if st.session_state.index is None:
@@ -497,27 +572,92 @@ def main_content():
                     )
                 
                 st.markdown("---")
+
+
+def rag_tab():
+    """RAG智能问答标签页"""
+    st.markdown("### RAG智能问答模式")
+    st.caption("基于检索增强生成，结合LLM理解后给出自然语言回答")
     
-    st.markdown("---")
-    st.subheader("📜 查询历史")
+    if st.session_state.index is None:
+        st.warning("请先在侧边栏构建向量库")
+        return
     
-    if st.session_state.query_history:
-        cols = st.columns(2)
-        for i, hist in enumerate(reversed(st.session_state.query_history[-6:])):
-            with cols[i % 2]:
-                if st.button(f"↻ {hist[:25]}{'...' if len(hist) > 25 else ''}", 
-                           key=f"history_{i}", use_container_width=True):
-                    st.session_state.last_query = hist
-                    st.rerun()
-    else:
-        st.info("暂无查询历史")
+    question = st.text_input(
+        "输入您的问题",
+        value=st.session_state.get('rag_question', ''),
+        placeholder="例如：张无忌为什么会修炼九阳神功？",
+        help="输入关于倚天屠龙记的问题"
+    )
+    
+    if question and question != st.session_state.get('rag_question'):
+        st.session_state.rag_question = question
+    
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        retrieve_k = st.number_input("检索片段数", min_value=3, max_value=10, value=5)
+    
+    ask_clicked = st.button("提问", type="primary") if question else False
+    
+    if ask_clicked and question:
+        with st.spinner("正在处理..."):
+            try:
+                client = get_embedding_client(st.session_state.api_key)
+                query_embedding = get_embeddings_batch(client, [question])[0]
+                similarities, indices = search(st.session_state.index, query_embedding, k=retrieve_k)
+                
+                retrieved_chunks = []
+                for sim, idx in zip(similarities, indices):
+                    if idx < len(st.session_state.metadata):
+                        chunk = st.session_state.metadata[idx].copy()
+                        chunk['similarity'] = float(sim)
+                        retrieved_chunks.append(chunk)
+                
+                st.session_state.retrieved_chunks = retrieved_chunks
+                
+                answer = rag_answer(client, question, retrieved_chunks)
+                st.session_state.rag_answer = answer
+                
+                if question not in st.session_state.query_history:
+                    st.session_state.query_history.append(question)
+                st.session_state.rag_question = None
+                
+            except Exception as e:
+                st.error(f"处理失败: {str(e)}")
+                return
+    
+    if st.session_state.rag_answer:
+        st.markdown("---")
+        st.subheader("回答")
+        st.markdown(st.session_state.rag_answer)
+        
+        st.markdown("---")
+        st.subheader("参考来源")
+        
+        retrieved_chunks = st.session_state.retrieved_chunks
+        for i, chunk in enumerate(retrieved_chunks):
+            sim_percent = chunk['similarity'] * 100
+            with st.expander(f"片段{i+1}：{chunk['chapter_title']} (相似度: {sim_percent:.1f}%)"):
+                st.text_area(
+                    "原文",
+                    chunk['text'],
+                    height=120,
+                    key=f"rag_chunk_{i}",
+                    disabled=True
+                )
+        
+        st.caption("回答基于检索到的原文片段生成，仅供参考")
+        
+        if st.button("清除回答"):
+            st.session_state.rag_answer = None
+            st.session_state.retrieved_chunks = None
+            st.rerun()
 
 
 def main():
     """主函数"""
     st.set_page_config(
         page_title="倚天屠龙记 - 向量检索",
-        page_icon="📚",
         layout="wide"
     )
     
