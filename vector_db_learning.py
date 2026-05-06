@@ -19,7 +19,7 @@ import faiss
 from openai import OpenAI
 
 # ============== 配置 ==============
-DATA_SOURCE = "金庸-倚天屠龙记txt精校版 .txt"
+DATA_SOURCE = "yitian_tulongji.txt"
 OUTPUT_DIR = "."
 
 # 向量配置

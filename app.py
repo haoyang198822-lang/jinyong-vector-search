@@ -25,7 +25,7 @@ import networkx as nx
 from pyvis.network import Network
 
 # ============== 配置 ==============
-DATA_SOURCE = "金庸-倚天屠龙记txt精校版 .txt"
+DATA_SOURCE = "yitian_tulongji.txt"
 
 # 向量配置
 EMBEDDING_MODEL = "text-embedding-v4"
@@ -815,20 +815,14 @@ def rag_tab():
     question = st.text_input(
         "输入您的问题",
         value=st.session_state.get('rag_question', ''),
-        placeholder="例如：张无忌为什么会修炼九阳神功？",
+        placeholder="输入问题后按回车直接生成回答",
         help="输入关于倚天屠龙记的问题"
     )
     
     if question and question != st.session_state.get('rag_question'):
         st.session_state.rag_question = question
-    
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        retrieve_k = st.number_input("检索片段数", min_value=3, max_value=10, value=5)
-    
-    ask_clicked = st.button("提问", type="primary") if question else False
-    
-    if ask_clicked and question:
+        retrieve_k = 5
+        
         with st.spinner("正在处理..."):
             try:
                 client = get_embedding_client(st.session_state.api_key)
